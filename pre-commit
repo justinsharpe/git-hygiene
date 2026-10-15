@@ -1,0 +1,175 @@
+#!/bin/sh
+# git-hygiene — pre-commit gate. Canonical source; install per README.md.
+#
+# Enforces, on every commit:
+#   1. Bulk-stage guard — reject commits staging more than a configured number
+#      of files, and reject staging build-artifact paths regardless of count.
+#   2. Secret scan — gitleaks (optional; skipped cleanly when absent) plus a
+#      belt-and-braces pattern scan for sk-/ghp_/gho_/AIza-shaped tokens.
+#   3. Forbidden-file policy — no .env files, backups/, or archives.
+#   4. Optional context-cap gate — runs an external checker you point it at.
+#
+# Configuration (highest precedence first):
+#   environment variables (GIT_HYGIENE_*) → repo-root `.git-hygiene` file
+#   (a POSIX shell snippet of KEY=value lines) → built-in defaults.
+# See README.md for the full reference.
+
+# ---- configuration ----------------------------------------------------
+TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+# Snapshot environment overrides so the config file cannot clobber them.
+_GH_ENV_BULK_CAP="${GIT_HYGIENE_BULK_CAP-__GH_UNSET__}"
+_GH_ENV_BULK_OK="${GIT_HYGIENE_BULK_OK-__GH_UNSET__}"
+_GH_ENV_LOG="${GIT_HYGIENE_LOG-__GH_UNSET__}"
+_GH_ENV_GT_MAX_BYTES="${GIT_HYGIENE_GITLEAKS_MAX_BYTES-__GH_UNSET__}"
+_GH_ENV_SECRET_EXCLUDE="${GIT_HYGIENE_SECRET_EXCLUDE-__GH_UNSET__}"
+_GH_ENV_FORBIDDEN="${GIT_HYGIENE_FORBIDDEN_PATTERN-__GH_UNSET__}"
+_GH_ENV_ARTIFACT="${GIT_HYGIENE_ARTIFACT_PATTERN-__GH_UNSET__}"
+_GH_ENV_CTX_CHECK="${GIT_HYGIENE_CTX_CHECK-__GH_UNSET__}"
+
+# Defaults (lowest precedence). Default log path is per-repo under .git/ —
+# never a hardcoded home-directory path.
+GIT_HYGIENE_BULK_CAP="${GIT_HYGIENE_BULK_CAP:-100}"
+GIT_HYGIENE_BULK_OK="${GIT_HYGIENE_BULK_OK:-0}"
+GIT_HYGIENE_LOG="${GIT_HYGIENE_LOG:-$TOPLEVEL/.git/git-hygiene.log}"
+GIT_HYGIENE_GITLEAKS_MAX_BYTES="${GIT_HYGIENE_GITLEAKS_MAX_BYTES:-52428800}"
+GIT_HYGIENE_SECRET_EXCLUDE="${GIT_HYGIENE_SECRET_EXCLUDE:-}"
+GIT_HYGIENE_FORBIDDEN_PATTERN="${GIT_HYGIENE_FORBIDDEN_PATTERN:-\\.env$|backups/|.*\\.zip$}"
+GIT_HYGIENE_ARTIFACT_PATTERN="${GIT_HYGIENE_ARTIFACT_PATTERN:-(^|/)(DerivedData|node_modules|\\.build|build/Debug|build/Release|\\.xcresult)/}"
+GIT_HYGIENE_CTX_CHECK="${GIT_HYGIENE_CTX_CHECK:-}"
+
+# Repo-local config file (middle precedence).
+if [ -n "$TOPLEVEL" ] && [ -r "$TOPLEVEL/.git-hygiene" ]; then
+  . "$TOPLEVEL/.git-hygiene"
+fi
+
+# Restore environment overrides (highest precedence).
+[ "$_GH_ENV_BULK_CAP" != "__GH_UNSET__" ] && GIT_HYGIENE_BULK_CAP="$_GH_ENV_BULK_CAP"
+[ "$_GH_ENV_BULK_OK" != "__GH_UNSET__" ] && GIT_HYGIENE_BULK_OK="$_GH_ENV_BULK_OK"
+[ "$_GH_ENV_LOG" != "__GH_UNSET__" ] && GIT_HYGIENE_LOG="$_GH_ENV_LOG"
+[ "$_GH_ENV_GT_MAX_BYTES" != "__GH_UNSET__" ] && GIT_HYGIENE_GITLEAKS_MAX_BYTES="$_GH_ENV_GT_MAX_BYTES"
+[ "$_GH_ENV_SECRET_EXCLUDE" != "__GH_UNSET__" ] && GIT_HYGIENE_SECRET_EXCLUDE="$_GH_ENV_SECRET_EXCLUDE"
+[ "$_GH_ENV_FORBIDDEN" != "__GH_UNSET__" ] && GIT_HYGIENE_FORBIDDEN_PATTERN="$_GH_ENV_FORBIDDEN"
+[ "$_GH_ENV_ARTIFACT" != "__GH_UNSET__" ] && GIT_HYGIENE_ARTIFACT_PATTERN="$_GH_ENV_ARTIFACT"
+[ "$_GH_ENV_CTX_CHECK" != "__GH_UNSET__" ] && GIT_HYGIENE_CTX_CHECK="$_GH_ENV_CTX_CHECK"
+
+# ---- helpers ----------------------------------------------------------
+_gh_log() {
+  if [ -n "$GIT_HYGIENE_LOG" ]; then
+    mkdir -p "$(dirname "$GIT_HYGIENE_LOG")" 2>/dev/null || true
+    printf '%s\n' "$*" >> "$GIT_HYGIENE_LOG" 2>/dev/null || true
+  fi
+}
+
+# ---- 1. bulk-stage guard ----------------------------------------------
+if [ "$GIT_HYGIENE_BULK_OK" != "1" ]; then
+  staged_count="$(git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')"
+  if [ -n "$staged_count" ] && [ "$staged_count" -gt "$GIT_HYGIENE_BULK_CAP" ] 2>/dev/null; then
+    echo "❌ BULK-STAGE GUARD BLOCKED: $staged_count staged files exceeds cap of $GIT_HYGIENE_BULK_CAP."
+    echo "   Inspect: git diff --cached --stat"
+    echo "   Fix: keep only YOUR files — git restore --staged <everything-else> — then re-commit."
+    echo "   Legitimate bulk commits set GIT_HYGIENE_BULK_OK=1; everyone else must not."
+    exit 1
+  fi
+
+  artifacts="$(git diff --cached --name-only 2>/dev/null | grep -E "$GIT_HYGIENE_ARTIFACT_PATTERN" | head -10)"
+  if [ -n "$artifacts" ]; then
+    echo "❌ BULK-STAGE GUARD BLOCKED: build artifacts staged:"
+    echo "$artifacts"
+    echo "   Build artifacts never belong in history — git restore --staged <paths>, then re-commit."
+    echo "   Intentional artifact commit: GIT_HYGIENE_BULK_OK=1."
+    exit 1
+  fi
+fi
+
+# ---- 2. secret scan ---------------------------------------------------
+_gh_log "$(date '+%Y-%m-%d %H:%M:%S %z') pre-commit: begin (cap=$GIT_HYGIENE_BULK_CAP bulk_ok=$GIT_HYGIENE_BULK_OK)"
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gt_tmp="$(mktemp -d 2>/dev/null)" || gt_tmp=""
+  if [ -n "$gt_tmp" ]; then
+    # Copy each staged blob into a temp tree and run gitleaks' full ruleset
+    # over real file shapes (no diff +/- prefixes). Blobs over the size
+    # threshold are skipped: a >50MB binary cannot hide a regex-shaped secret
+    # and git's content hash already pins the blob's identity.
+    git diff --cached --name-only 2>/dev/null | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      git cat-file -e ":$f" 2>/dev/null || continue
+      sz="$(git cat-file -s ":$f" 2>/dev/null || echo 0)"
+      if [ -n "$sz" ] && [ "$sz" -gt "$GIT_HYGIENE_GITLEAKS_MAX_BYTES" ] 2>/dev/null; then
+        _gh_log "  gitleaks: skip ${sz}-byte blob $f (large-binary skip, hash-pinned by git)"
+        continue
+      fi
+      mkdir -p "$gt_tmp/$(dirname "$f")" 2>/dev/null
+      git show ":$f" > "$gt_tmp/$f" 2>/dev/null || true
+    done
+    gitleaks_cfg=""
+    [ -r "$TOPLEVEL/.gitleaks.toml" ] && gitleaks_cfg="--config $TOPLEVEL/.gitleaks.toml"
+    _gh_log_redir="/dev/null"
+    [ -n "$GIT_HYGIENE_LOG" ] && _gh_log_redir="$GIT_HYGIENE_LOG"
+    if [ -n "$(ls -A "$gt_tmp" 2>/dev/null)" ]; then
+      # shellcheck disable=SC2086
+      gitleaks detect --no-git --source "$gt_tmp" $gitleaks_cfg --redact --no-banner --exit-code 1 2>>"$_gh_log_redir"
+      rc=$?
+    else
+      rc=0
+    fi
+    rm -rf "$gt_tmp"
+    if [ "$rc" -ne 0 ]; then
+      echo "❌ PRE-COMMIT BLOCKED: gitleaks found secrets in staged content."
+      echo "   Details: ${GIT_HYGIENE_LOG:-<logging disabled>}"
+      exit 1
+    fi
+  else
+    _gh_log "  gitleaks: could not create temp dir — scan skipped"
+    echo "⚠️  gitleaks scan skipped (temp dir unavailable)."
+  fi
+else
+  _gh_log "  gitleaks: not installed — gitleaks scan skipped (legacy pattern scan still runs)"
+  echo "ℹ️  gitleaks not found — skipping gitleaks scan (legacy pattern scan still runs)."
+  echo "   Install gitleaks (https://github.com/gitleaks/gitleaks) for full secret coverage."
+fi
+
+# Legacy belt-and-braces pattern scan (sk-/ghp_/gho_/AIza classes) — always runs,
+# independent of gitleaks. GIT_HYGIENE_SECRET_EXCLUDE is a whitespace-separated
+# list of paths/globs to exclude from this scan.
+set -f
+set -- "."
+for _x in $GIT_HYGIENE_SECRET_EXCLUDE; do
+  [ -n "$_x" ] && set -- "$@" ":(exclude)$_x"
+done
+set +f
+secrets_found="$(git diff --cached -U0 -- "$@" 2>/dev/null \
+  | grep -iE '(^|[^a-zA-Z0-9_-])(sk-[a-zA-Z0-9][a-zA-Z0-9_-]{19,}|ghp_[a-zA-Z0-9]{20,}|gho_[a-zA-Z0-9]{20,}|AIza[a-zA-Z0-9_-]{20,})' \
+  | grep '^+')"
+
+if [ -n "$secrets_found" ]; then
+  echo "❌ SECURITY COMMIT BLOCKED: secret key detected in staged diff!"
+  echo "$secrets_found" | head -5
+  exit 1
+fi
+
+# ---- 3. forbidden-file policy -----------------------------------------
+forbidden_files="$(git diff --cached --name-only 2>/dev/null | grep -E "$GIT_HYGIENE_FORBIDDEN_PATTERN")"
+if [ -n "$forbidden_files" ]; then
+  echo "❌ SECURITY COMMIT BLOCKED: staged file violates policy:"
+  echo "$forbidden_files"
+  exit 1
+fi
+
+# ---- 4. optional context-cap gate -------------------------------------
+if [ -n "$GIT_HYGIENE_CTX_CHECK" ] && git diff --cached --name-only 2>/dev/null | grep -q 'AGENTS\.md$'; then
+  checker="$GIT_HYGIENE_CTX_CHECK"
+  case "$checker" in
+    /*) : ;;
+    *) checker="$TOPLEVEL/$checker" ;;
+  esac
+  if [ -x "$checker" ]; then
+    if ! "$checker" --root "$TOPLEVEL" --gate; then
+      echo "❌ COMMIT BLOCKED: context-cap gate failed ($checker)."
+      exit 1
+    fi
+  fi
+fi
+
+exit 0

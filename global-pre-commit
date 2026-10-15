@@ -1,0 +1,66 @@
+#!/bin/sh
+# git-hygiene — global pre-commit hook (install via core.hooksPath).
+#
+# Install: point git's `core.hooksPath` at the directory containing this file,
+# e.g. `git config --global core.hooksPath ~/.git-hooks`. Git then runs this hook
+# in every repo and never reads .git/hooks/. Living outside any repo means no
+# branch can fork it away.
+#
+# Sections:
+#   1. Identity law (optional) — enforce a fixed author name/email.
+#   2. Master-law advisory — warn when AGENTS.md is edited inside a linked worktree.
+#   3. Repo-gate delegation — run the repo's own pre-commit gate, if present.
+
+# ---- 1. identity law (optional) ---------------------------------------
+# Enforced only when both GIT_HYGIENE_AUTHOR_NAME and GIT_HYGIENE_AUTHOR_EMAIL
+# are set (env or global git config). Rejects commits whose author is not the
+# configured identity, keeping attribution clean across every repo.
+name="$(git config user.name 2>/dev/null || true)"
+email="$(git config user.email 2>/dev/null || true)"
+want_name="${GIT_HYGIENE_AUTHOR_NAME:-}"
+want_email="${GIT_HYGIENE_AUTHOR_EMAIL:-}"
+
+if [ -n "$want_name" ] && [ -n "$want_email" ]; then
+  if [ "$name" != "$want_name" ] || [ "$email" != "$want_email" ]; then
+    echo ""
+    echo "✋ IDENTITY LAW: commits must author as $want_name <$want_email>"
+    echo "   This commit would have been: $name <$email>"
+    echo ""
+    echo "   FIX: repair the repo config or drop -c user.name/user.email overrides:"
+    echo "     git config user.name '$want_name'"
+    echo "     git config user.email '$want_email'"
+    echo ""
+    exit 1
+  fi
+fi
+
+# ---- 2. master-law advisory (non-blocking) ----------------------------
+if [ "${GIT_HYGIENE_MASTER_LAW:-1}" != "0" ]; then
+  if git diff --cached --name-only 2>/dev/null | grep -q 'AGENTS\.md$'; then
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    # In a linked worktree, .git is a FILE pointing at the real git dir.
+    if [ -n "$top" ] && [ -f "$top/.git" ]; then
+      echo ""
+      echo "⚠️  MASTER-LAW GUARD: committing AGENTS.md inside a linked worktree."
+      echo "    If this is an ADOPT of the current master, fine — continue."
+      echo "    If it is a NEW rule, land it on the shared branch instead."
+      echo ""
+    fi
+  fi
+fi
+
+# ---- 3. repo-gate delegation ------------------------------------------
+# Any repo carrying a local gate runs it; its exit code is honoured. Repos
+# without one are untouched. Invoked via sh on purpose: the gate travels at
+# mode 644 (a hook SOURCE), so an -x test would silently skip it.
+top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+gate_rel="${GIT_HYGIENE_REPO_GATE:-tools/git-hygiene/pre-commit}"
+if [ -n "$top" ] && [ -f "$top/$gate_rel" ]; then
+  sh "$top/$gate_rel" "$@"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    exit "$rc"
+  fi
+fi
+
+exit 0

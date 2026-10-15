@@ -1,0 +1,56 @@
+#!/bin/sh
+# git-hygiene — reference-transaction hook (no-stash guard). Install per README.md.
+#
+# A `git stash push/store/create` MUST create or update refs/stash, and every
+# ref update passes through this hook. Refusing refs/stash creation aborts the
+# stash before the worktree is touched: git saves the WIP commits first, updates
+# refs/stash second, and only resets the worktree after the ref update succeeds.
+# A blocked stash leaves the worktree exactly as it was — no WIP is lost. No
+# shell wrapper, alias, or cron invocation can bypass it.
+#
+# Scope: only stash CREATION/UPDATE (a non-zero new value) is blocked. Deleting
+# refs/stash (`git stash drop`, or a pop's final cleanup) is allowed — deletion
+# never touches the worktree, and blocking a pop's delete would leave a
+# half-completed pop.
+#
+# Config: GIT_HYGIENE_STASH_OK=1 to allow a stash (escape hatch),
+#         GIT_HYGIENE_STASH_LOG to move the block log (default: .git/stash-block.log).
+
+# The hook fires twice per transaction ("prepared", then "committed").
+# Only the "prepared" stage can abort; never act on "committed".
+[ "$1" = "prepared" ] || exit 0
+
+[ "${GIT_HYGIENE_STASH_OK:-0}" = "1" ] && exit 0
+
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || git rev-parse --git-dir 2>/dev/null || true)"
+LOG="${GIT_HYGIENE_STASH_LOG:-$git_dir/stash-block.log}"
+
+blocked=0
+while read -r old new ref; do
+  case "$ref" in
+    refs/stash)
+      # Creation/update only — a zero new value is a delete (drop/pop cleanup).
+      if [ "$new" != "0000000000000000000000000000000000000000" ]; then
+        blocked=1
+        if [ -n "$LOG" ]; then
+          {
+            echo "$(date '+%Y-%m-%d %H:%M:%S %z') BLOCKED refs/stash update old=$old new=$new"
+            echo "  cwd=$PWD"
+            echo "  caller=$(ps -o command= -p "$PPID" 2>/dev/null | head -c 300)"
+          } >> "$LOG" 2>/dev/null || true
+        fi
+      fi
+      ;;
+  esac
+done
+
+if [ "$blocked" = "1" ]; then
+  echo "❌ NO-STASH GUARD BLOCKED: git stash is forbidden in this repository." >&2
+  echo "   Stashing can write merge-conflict markers into tracked files and" >&2
+  echo "   silently corrupt repo state. Your worktree is untouched." >&2
+  echo "   Alternatives: commit WIP to a branch, or copy files out of the tree." >&2
+  echo "   Approved exception only: GIT_HYGIENE_STASH_OK=1" >&2
+  exit 1
+fi
+
+exit 0
