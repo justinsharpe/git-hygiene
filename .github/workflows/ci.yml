@@ -1,0 +1,16 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell scripts (POSIX sh)
+        run: shellcheck -e SC1091 pre-commit global-pre-commit hooktest.sh
+      - name: Run hook self-test
+        run: ./hooktest.sh
